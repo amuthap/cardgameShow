@@ -175,6 +175,11 @@ def draw_text(text, font, color, surface, x, y):
     text_rect.topleft = (x, y)
     surface.blit(text_obj, text_rect)
 
+def draw_button(text, rect, color, font=FONT):
+    pygame.draw.rect(screen, color, rect)
+    pygame.draw.rect(screen, BLACK, rect, 2)
+    draw_text(text, font, WHITE, screen, rect.x + 10, rect.y + 5)
+
 # --- Helper Functions ---
 def get_card_key_from_display_name(display_name):
     """Converts a display name (e.g., 'Ace of Spades') to a filename key (e.g., 'ace_of_spades')."""
@@ -191,6 +196,25 @@ def get_card_key_from_display_name(display_name):
 
     # print(f"Converted '{display_name}' to key '{key}'") # Optional debug
     return key
+
+def get_card_value(card_str):
+    # Extract rank from card string (e.g., 'Jack of Clubs')
+    if not card_str or not isinstance(card_str, str):
+        return ""
+    rank = card_str.split(' ')[0]
+    if rank.isdigit():
+        return int(rank)
+    rank = rank.lower()
+    if rank == 'jack':
+        return 11
+    elif rank == 'queen':
+        return 12
+    elif rank == 'king':
+        return 13
+    elif rank == 'ace':
+        return 1
+    else:
+        return ""
 
 # Store card rects locally for click detection
 my_hand_rects = []
@@ -217,6 +241,9 @@ def draw_my_hand(hand_cards, card_images, x_start, y_pos):
                     card_rect = pygame.Rect(card_x, y_pos, CARD_WIDTH, CARD_HEIGHT)
                     my_hand_rects.append(card_rect)
                     screen.blit(image, card_rect.topleft)
+                    # Draw value below the card
+                    value = get_card_value(card_str)
+                    draw_text(str(value), SMALL_FONT, WHITE, screen, card_x + CARD_WIDTH // 2 - 8, y_pos + CARD_HEIGHT + 5)
                 else:
                     print(f"Error: Image not found for card '{card_str}' (key: '{card_key}')")
             else:
@@ -232,6 +259,8 @@ def draw_my_hand(hand_cards, card_images, x_start, y_pos):
                 if image:
                     card_rect = my_hand_rects[i]
                     screen.blit(image, card_rect.topleft)
+                    value = get_card_value(card_str)
+                    draw_text(str(value), SMALL_FONT, WHITE, screen, card_rect.x + CARD_WIDTH // 2 - 8, card_rect.y + CARD_HEIGHT + 5)
                 else:
                     print(f"Error: Image not found for card '{card_str}' (key: '{card_key}')")
             elif not card_key:
@@ -285,7 +314,13 @@ def main():
     running = True
     card_images = load_card_images()
     deck_rect = pygame.Rect(DECK_POS[0], DECK_POS[1], CARD_WIDTH, CARD_HEIGHT)
-    has_discarded_this_turn = False # Track if player has discarded this turn
+    pending_rect = pygame.Rect(DISCARD_POS[0] + CARD_WIDTH + 30, DISCARD_POS[1], CARD_WIDTH, CARD_HEIGHT)
+    same_number_btn_rect = pygame.Rect(pending_rect.x, pending_rect.y + CARD_HEIGHT + 20, 140, 40)
+    show_btn_rect = pygame.Rect(SCREEN_WIDTH - 200, SCREEN_HEIGHT - 80, 120, 50)
+    new_game_btn_rect = pygame.Rect(SCREEN_WIDTH//2 - 60, 180, 180, 50)
+    has_discarded_this_turn = False
+    show_result = None
+    show_result_time = 0
 
     if not connect_to_server():
         print("Failed to connect to server. Exiting.")
@@ -293,16 +328,12 @@ def main():
 
     threading.Thread(target=receive_updates, daemon=True).start()
 
-    # --- Wait for initial state ---
     print("Waiting for initial game state from server...")
     while latest_game_state is None and client_socket is not None:
-        # Check if the socket is still alive while waiting
         if unexpected_disconnect:
              print("Disconnected while waiting for initial state.")
-             # Handle reconnection or exit logic here if needed
-             # For now, just break the waiting loop
              break
-        time.sleep(0.1) # Wait briefly before checking again
+        time.sleep(0.1)
 
     if latest_game_state is None:
         print("Failed to receive initial game state. Exiting.")
@@ -311,10 +342,8 @@ def main():
         pygame.quit()
         return
     print("Initial game state received.")
-    # Ensure client_id is set (should be set by receive_updates)
     if client_id is None:
         print("Warning: client_id not set after receiving initial state.")
-        # Attempt to get it from the state again, though it should be set
         with network_lock:
             client_id = latest_game_state.get("my_id")
         if client_id is None:
@@ -326,74 +355,132 @@ def main():
     while running:
         clicked = False
         mouse_pos = pygame.mouse.get_pos()
+        same_number_btn_clicked = False
+        show_btn_clicked = False
+        new_game_btn_clicked = False
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:  # Left click
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 clicked = True
+                if pending_discard and same_number_btn_rect.collidepoint(mouse_pos):
+                    same_number_btn_clicked = True
+                if show_btn_rect.collidepoint(mouse_pos):
+                    show_btn_clicked = True
+                if show_result and new_game_btn_rect.collidepoint(mouse_pos):
+                    new_game_btn_clicked = True
 
         screen.fill(GREEN_TABLE)
 
-        # --- Get latest state (thread-safe) ---
         current_state = None
         with network_lock:
             if latest_game_state:
                 current_state = latest_game_state.copy()
-                # Reset has_discarded_this_turn if it's no longer our turn
                 if current_state.get("current_turn_player_id") != client_id:
                     has_discarded_this_turn = False
 
-        # --- Client-Side Logic ---
         if current_state and client_id is not None:
             my_turn = current_state.get("current_turn_player_id") == client_id
             my_hand = current_state.get("my_hand", [])
             deck_size = current_state.get("deck_size", 0)
             discard_pile_top = current_state.get("discard_pile_top", None)
+            pending_discard = current_state.get("pending_discard", None)
+            pending_discard_player = current_state.get("pending_discard_player", None)
 
-            if my_turn and clicked:
-                # Check for card clicks (Discard) - only if haven't discarded yet
-                if not has_discarded_this_turn:
+            if my_turn and clicked and not show_result:
+                # If not yet discarded, allow discard
+                if not has_discarded_this_turn and not pending_discard:
                     for i, card_rect in enumerate(my_hand_rects):
                         if card_rect.collidepoint(mouse_pos):
                             if i < len(my_hand):
                                 discard_card = my_hand[i]
                                 send_action({"action": "discard_card", "card": discard_card})
                                 print(f"Attempting to discard card: {discard_card}")
-                                has_discarded_this_turn = True # Mark that we've discarded
+                                has_discarded_this_turn = True
                                 clicked = False
                                 break
-
-                # Check for deck click (Draw) - only if already discarded
-                elif has_discarded_this_turn and deck_rect.collidepoint(mouse_pos):
-                    if deck_size > 0:  # Only if there are cards in the deck
+                # If pending discard exists and player has discarded, allow draw from deck or discard pile
+                elif has_discarded_this_turn and pending_discard:
+                    if same_number_btn_clicked:
+                        send_action({"action": "same_number_skip"})
+                        print("Attempting Same Number skip")
+                    elif deck_rect.collidepoint(mouse_pos) and deck_size > 0:
                         send_action({"action": "draw_card"})
                         print("Attempting to draw a card from deck")
-                        has_discarded_this_turn = False  # Reset for next turn
+                        has_discarded_this_turn = False
+                        clicked = False
+                    elif pygame.Rect(DISCARD_POS[0], DISCARD_POS[1], CARD_WIDTH, CARD_HEIGHT).collidepoint(mouse_pos):
+                        send_action({"action": "draw_from_discard_pile"})
+                        print("Attempting to draw the top card from discard pile")
+                        has_discarded_this_turn = False
                         clicked = False
 
-            # Draw game state
+            if show_btn_clicked and not show_result:
+                send_action({"action": "show"})
+                print("SHOW button clicked!")
+                show_btn_clicked = False
+
+            # Draw hand, other players, deck, discard pile
             draw_my_hand(my_hand, card_images, 50, 400)
             draw_other_players(current_state.get("players", {}), client_id, card_images)
-            
-            # Draw deck with visual feedback
-            if my_turn and has_discarded_this_turn and deck_size > 0:
-                # Highlight deck when it's available to draw
-                pygame.draw.rect(screen, (255, 255, 0), deck_rect, 2)  # Yellow highlight
             draw_deck(deck_size, card_images, DECK_POS)
-            
             draw_discard_pile(discard_pile_top, card_images, DISCARD_POS)
 
+            # Draw pending discard visually (support multiple cards)
+            if pending_discard:
+                for idx, pending_card in enumerate(pending_discard):
+                    card_key = get_card_key_from_display_name(pending_card)
+                    image = card_images.get(card_key, card_images.get("back"))
+                    if image:
+                        # Offset each pending card horizontally
+                        x_offset = pending_rect.x + idx * (CARD_WIDTH + 10)
+                        screen.blit(image, (x_offset, pending_rect.y))
+                        pygame.draw.rect(screen, (255, 215, 0), (x_offset, pending_rect.y, CARD_WIDTH, CARD_HEIGHT), 3)
+                        draw_text("Pending", SMALL_FONT, WHITE, screen, x_offset, pending_rect.y - 20)
+                # Draw Same Number button below the first pending card
+                draw_button("Same Number", same_number_btn_rect, (0, 128, 255), SMALL_FONT)
+
+            # Draw SHOW button only if game not ended
+            if not show_result:
+                draw_button("SHOW", show_btn_rect, (255, 100, 0), FONT)
+
+            # Display result if available
+            if current_state.get("show_result"):
+                show_result = current_state["show_result"]
+                show_result_time = time.time()
+            if show_result:
+                color = (0, 200, 0) if show_result == "Winner" else (200, 0, 0)
+                draw_text(f"You are a {show_result}!", FONT, color, screen, SCREEN_WIDTH//2 - 100, 100)
+                # Draw New Game button
+                draw_button("New Game", new_game_btn_rect, (0, 180, 0), FONT)
+                # Block all other actions until new game
+                if new_game_btn_clicked:
+                    send_action({"action": "new_game"})
+                    show_result = None
+                    print("New Game button clicked!")
+                    # Optionally reset local state
+                    has_discarded_this_turn = False
+                    continue
+
             # Draw turn status
-            if my_turn:
+            if my_turn and not show_result:
                 status_text = "Your turn - "
-                if not has_discarded_this_turn:
+                if not has_discarded_this_turn and not pending_discard:
                     status_text += "Discard a card"
+                elif has_discarded_this_turn and pending_discard:
+                    status_text += "Draw from deck or pending discard"
                 else:
-                    status_text += "Draw a card"
+                    status_text += "Waiting..."
                 draw_text(status_text, FONT, WHITE, screen, 10, 10)
-            else:
+            elif not show_result:
                 draw_text(f"Waiting for other player", FONT, WHITE, screen, 10, 10)
+
+            # Block all game actions if show_result is set
+            if show_result:
+                pygame.display.flip()
+                clock.tick(60)
+                continue
 
         pygame.display.flip()
         clock.tick(60)

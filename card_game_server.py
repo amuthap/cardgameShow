@@ -80,6 +80,7 @@ class Game:
         self.game_started = False
         self.min_players = 2 # Minimum players to start
         self.has_discarded = False  # Track if current player has discarded
+        self.pending_discard = None  # (list of cards, player_id) tuple or None
 
     def add_player(self, player_id, name="Player"):
         with self.lock:
@@ -116,12 +117,18 @@ class Game:
                 self.deck = Deck() # New shuffled deck
                 self.discard_pile = []
                 self.has_discarded = False  # Reset discard flag
+                self.pending_discard = None  # Reset pending discard
                 # Deal cards
                 for _ in range(cards_per_player):
                     for player_id in self.player_order:
                         card = self.deck.deal_card()
                         if card:
                             self.players[player_id].add_card(card)
+                # Place an opening card in the discard pile
+                if len(self.deck) > 0:
+                    opening_card = self.deck.deal_card()
+                    self.discard_pile.append(opening_card)
+                    print(f"Opening card in discard pile: {opening_card}")
                 # Set first player's turn
                 if self.player_order:
                     self.current_turn_player_id = self.player_order[0]
@@ -146,6 +153,7 @@ class Game:
                 next_index = (current_index + 1) % len(self.player_order)
                 self.current_turn_player_id = self.player_order[next_index]
                 self.has_discarded = False  # Reset discard flag for new turn
+                self.pending_discard = None  # Reset pending discard for new turn
                 print(f"[next_turn] Turn advanced. New turn ID: {self.current_turn_player_id}") # Simple success log
             except ValueError:
                 # This case should ideally not happen if player removal is handled correctly
@@ -153,6 +161,7 @@ class Game:
                 if self.player_order:
                     self.current_turn_player_id = self.player_order[0]
                     self.has_discarded = False  # Reset discard flag
+                    self.pending_discard = None  # Reset pending discard
                 else:
                     self.current_turn_player_id = None
             except Exception as e:
@@ -187,9 +196,33 @@ class Game:
                 "discard_pile_top": str(self.discard_pile[-1]) if self.discard_pile else None,
                 "current_turn_player_id": self.current_turn_player_id,
                 "game_started": self.game_started,
-                "player_order": self.player_order # Send order for UI if needed
+                "player_order": self.player_order, # Send order for UI if needed
+                "pending_discard": [str(card) for card in self.pending_discard[0]] if self.pending_discard else None,
+                "pending_discard_player": self.pending_discard[1] if self.pending_discard else None,
+                "show_result": getattr(self, 'show_results', {}).get(player_id) if hasattr(self, 'show_results') else None,
             }
             return state
+
+    def get_card_value(self, card):
+        """Accepts a Card object or string."""
+        if isinstance(card, Card):
+            rank = card.rank
+        elif isinstance(card, str):
+            rank = card.split(' ')[0]
+        else:
+            return None
+        if rank.isdigit():
+            return int(rank)
+        rank = rank.lower()
+        if rank == 'jack':
+            return 11
+        elif rank == 'queen':
+            return 12
+        elif rank == 'king':
+            return 13
+        elif rank == 'ace':
+            return 1
+        return None
 
     def handle_action(self, player_id, action_data):
         """Handles actions received from a client."""
@@ -208,25 +241,22 @@ class Game:
             advance_turn = False
 
             if action == "discard_card":
-                # Can only discard if haven't already discarded this turn
-                if not self.has_discarded:
+                # Only allow if no pending discard
+                if not self.pending_discard and not self.has_discarded:
                     card_str = action_data.get("card")
                     if card_str:
-                        # Find the card in the player's hand
-                        card_to_remove = None
-                        for card in player.hand:
-                            if str(card) == card_str:
-                                card_to_remove = card
-                                break
-
-                        if card_to_remove:
+                        # Find all cards of the same value
+                        value = self.get_card_value(card_str)
+                        cards_to_remove = [card for card in player.hand if self.get_card_value(card) == value]
+                        if cards_to_remove:
                             try:
-                                player.hand.remove(card_to_remove)
-                                self.discard_pile.append(card_to_remove)
-                                print(f"Player {player.name} discarded {card_to_remove}.")
-                                self.has_discarded = True  # Mark that player has discarded
+                                for card in cards_to_remove:
+                                    player.hand.remove(card)
+                                self.pending_discard = (cards_to_remove, player_id)
+                                self.has_discarded = True
                                 action_processed = True
-                                advance_turn = False  # Don't advance turn after discard, wait for draw
+                                advance_turn = False
+                                print(f"Player {player.name} discarded {[str(c) for c in cards_to_remove]} (pending discard)")
                             except Exception as e:
                                 print(f"[handle_action] Error processing discard: {e}")
                         else:
@@ -234,22 +264,99 @@ class Game:
                     else:
                         print(f"Player {player.name}: Invalid discard_card action data.")
                 else:
-                    print(f"Action rejected: Player {player.name} has already discarded this turn.")
+                    print(f"Action rejected: Pending discard already exists or already discarded.")
 
             elif action == "draw_card":
-                # Can only draw if already discarded this turn
-                if self.has_discarded:
+                # Only allow if there is a pending discard and player has discarded
+                if self.pending_discard and self.has_discarded:
                     if len(self.deck) > 0:
                         drawn_card = self.deck.deal_card()
                         player.add_card(drawn_card)
                         print(f"Player {player.name} drew a card: {drawn_card}")
+                        # Move all pending cards to discard pile
+                        for card in self.pending_discard[0]:
+                            self.discard_pile.append(card)
+                        self.pending_discard = None
+                        self.has_discarded = False
                         action_processed = True
-                        advance_turn = True  # Advance turn after successful draw
-                        self.has_discarded = False  # Reset for next turn
+                        advance_turn = True
                     else:
                         print("Deck is empty! Cannot draw a card.")
                 else:
-                    print(f"Action rejected: Player {player.name} must discard before drawing.")
+                    print(f"Action rejected: Must discard before drawing.")
+
+            elif action == "draw_from_discard_pile":
+                # Only allow if there is a pending discard, player has discarded, and discard pile is not empty
+                if self.pending_discard and self.has_discarded and self.discard_pile:
+                    top_discard = self.discard_pile.pop()
+                    player.add_card(top_discard)
+                    print(f"Player {player.name} drew from discard pile: {top_discard}")
+                    for card in self.pending_discard[0]:
+                        self.discard_pile.append(card)
+                    self.pending_discard = None
+                    self.has_discarded = False
+                    action_processed = True
+                    advance_turn = True
+                else:
+                    print(f"Action rejected: Cannot draw from discard pile now.")
+
+            elif action == "same_number_skip":
+                # Only allow if there is a pending discard, player has discarded, and discard pile is not empty
+                if self.pending_discard and self.has_discarded and self.discard_pile:
+                    pending_cards = self.pending_discard[0]
+                    top_discard = self.discard_pile[-1]
+                    # If any pending card matches the top discard, allow skip
+                    if any(self.get_card_value(card) == self.get_card_value(top_discard) for card in pending_cards):
+                        for card in pending_cards:
+                            self.discard_pile.append(card)
+                        self.pending_discard = None
+                        self.has_discarded = False
+                        action_processed = True
+                        advance_turn = True
+                        print(f"Player {player.name} used Same Number skip.")
+                    else:
+                        print(f"Same Number skip failed: values do not match.")
+                        # Do not advance turn or clear has_discarded; allow player to draw
+                        action_processed = False
+                        advance_turn = False
+                else:
+                    print(f"Action rejected: Cannot use Same Number skip now.")
+                    action_processed = False
+                    advance_turn = False
+
+            elif action == "show":
+                # Calculate hand values for all players
+                hand_sums = {}
+                for pid, p in self.players.items():
+                    hand_sums[pid] = sum(self.get_card_value(card) for card in p.hand)
+                my_sum = hand_sums.get(player_id, 0)
+                min_sum = min(hand_sums.values())
+                # Winner if this player has the lowest sum (ties: winner if equal to min)
+                is_winner = my_sum == min_sum
+                # Store result in a dict for all players
+                if not hasattr(self, 'show_results'):
+                    self.show_results = {}
+                for pid in self.players:
+                    if hand_sums[pid] == min_sum:
+                        self.show_results[pid] = "Winner"
+                    else:
+                        self.show_results[pid] = "Losser"
+                action_processed = True
+                advance_turn = False
+                print(f"Player {self.players[player_id].name} clicked SHOW. Hand sums: {hand_sums}. Result: {self.show_results[player_id]}")
+
+            elif action == "new_game":
+                # Reset game state and start a new game
+                print(f"Player {self.players[player_id].name} requested a new game.")
+                if hasattr(self, 'show_results'):
+                    del self.show_results
+                self.start_game()
+                action_processed = True
+                advance_turn = False
+
+            elif action == "take_pending_discard":
+                # (No longer used in this logic)
+                pass
 
             return action_processed, advance_turn
 
